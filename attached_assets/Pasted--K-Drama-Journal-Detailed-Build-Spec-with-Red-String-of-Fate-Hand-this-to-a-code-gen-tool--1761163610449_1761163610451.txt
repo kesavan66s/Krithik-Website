@@ -1,0 +1,323 @@
+# K‑Drama Journal — Detailed Build Spec (with Red String of Fate)
+
+> Hand this to a code‑gen tool (e.g., Replit AI) to scaffold the project. It defines components, editor tools, analytics, embeds, theme, data, and acceptance criteria.
+
+---
+
+## 0) Overview
+
+A colorful, bubbly journal website with **two roles** (Admin, Reader), **front‑end inline editing** for Admin only, **full Instagram Reels + Spotify** embeds, and **precise reading analytics** (who/when/where/how much + re‑reads). A signature **Red String of Fate** motif visually ties chapters, pages, and reader journeys.
+
+**Stack (suggested):** Next.js (App Router) · TailwindCSS · Prisma + PostgreSQL · Auth.js (NextAuth) · TipTap editor (Admin only) · Edge runtime for analytics endpoints · Vercel/Cloudflare deploy.
+
+---
+
+## 1) Theme — “K‑Drama Diary” with Red String of Fate
+
+### 1.1 Design tokens
+
+* **Palette:** sakura #FFB7C5, lavender #B8A2FF, sky #CDE7F0, cream #FFF7DA, ink #2D2A32, **thread** #D7263D, knot shadows #A40E2D/#F25F5C.
+* **Typography:** Titles: *Nanum Myeongjo*; Body: *Noto Sans KR*.
+* **Corners & depth:** rounded‑2xl, soft shadow (blur 24px, spread 0, opacity 12–16%).
+* **Motion:** 120–180ms ease‑in‑out; respect `prefers-reduced-motion`.
+* **Iconography:** hearts, umbrellas, polaroids, petals.
+
+### 1.2 Motifs
+
+* **Signature Thread:** a thin red thread that runs in the sidebar and across page headers.
+* **Knots:** small heart‑shaped nodes at milestones and chapter breaks.
+* **Polaroids + thread loops:** images look pinned by the thread; gentle sway on hover.
+
+---
+
+## 2) Roles & Permissions
+
+* **Admin:** can create/edit/reorder chapters & pages **inline** (front‑end). Can set manual “Edited on” date, publish/unpublish, manage fate links, stickers, and media.
+* **Reader:** read‑only access to public pages. No editing.
+* Server actions and API routes enforce RBAC; the editor UI is hidden for Reader.
+
+---
+
+## 3) Content Model (DB)
+
+```ts
+// Prisma‑style types (reference)
+Chapter { id: string; title: string; emoji?: string; order: number; isPublic: boolean; createdAt; updatedAt }
+Page {
+  id: string; chapterId: string; title: string; slug: string; isPublic: boolean;
+  contentJSON: JSON;              // TipTap JSON
+  coverUrl?: string; mood?: string; tags: string[];
+  editedAtAuto: Date;             // updated on save
+  editedAtManual?: Date;          // optional override
+  createdBy: string; createdAt; updatedAt
+}
+FateLink { id: string; fromPageId: string; toPageId: string; weight: number }
+
+// Analytics
+Session { id: string; userId?: string; ua: string; country?: string; region?: string; city?: string; referrer?: string; utm?: JSON; startedAt: Date }
+PageView { id: string; sessionId: string; pageId: string; startedAt: Date; endedAt?: Date;
+           activeMs: number; maxScrollPct: number; completionMilestone?: 0|25|50|75|100; rereadOfId?: string }
+ReadProgress { id: string; pageViewId: string; milestone: 25|50|75|100; at: Date }
+MediaEvent { id: string; pageViewId: string; mediaType: 'instagram'|'spotify'; mediaId: string; action: 'play'|'pause'|'ended'|'seek'; positionSec?: number; at: Date }
+```
+
+**Rules:**
+
+* Display "Edited on" = `editedAtManual ?? editedAtAuto` (tooltip shows both if manual set).
+* A new **PageView** is created for each visit; if same user/session views again later, link via `rereadOfId` to the first view of that page.
+
+---
+
+## 4) Red‑String Components
+
+### 4.1 `<ThreadBar />`
+
+**Purpose:** A red thread acting as the page‑top progress bar and status line.
+
+**Responsibilities**
+
+* Visual reading progress (ties small **knots** at 25/50/75/100%).
+* Reflect active/paused state of tracking (taut vs. slack animation).
+* Emit custom events when milestones are crossed.
+
+**Props**
+
+```ts
+ThreadBarProps {
+  progress: number;           // 0..1 from scroll/observer
+  paused: boolean;            // true when tab hidden, unfocused, or idle
+  milestones?: number[];      // default [0.25, 0.5, 0.75, 1]
+  showLabels?: boolean;       // optional % labels at knots
+}
+```
+
+**Behavior**
+
+* Smoothly interpolate bar length as `progress` grows.
+* When `paused`, animate subtle "slack" (lower opacity & slight sag); resume taut on active.
+* Fire `onMilestone(m)` once per threshold per PageView.
+
+**A11y**
+
+* `role="progressbar"` with `aria-valuenow`/`aria-valuemin/max`.
+* High‑contrast: darker thread; visible knot outlines.
+
+---
+
+### 4.2 `<Knot />`
+
+**Purpose:** Visual nodes (hearts/knots) marking milestones or annotations.
+
+**Props**
+
+```ts
+KnotProps { positionPx: number; size?: 'sm'|'md'|'lg'; label?: string; tone?: 'primary'|'gold'|'muted'; }
+```
+
+**Behavior**
+
+* Pulses on hover/focus; tooltip shows `label` if set.
+* Can be used standalone (e.g., chapter separators) or inside ThreadBar.
+
+**A11y**
+
+* `aria-label` for screen readers; `tabindex=0` for focusable knots with tooltips.
+
+---
+
+### 4.3 `<FateLinks />`
+
+**Purpose:** Suggest the next 1–3 “fated” pages with thread connections.
+
+**Props & data**
+
+```ts
+FateLinksProps {
+  currentPageId: string;
+  candidates?: { id: string; title: string; slug: string; tags: string[]; mood?: string; coverUrl?: string }[];
+  strategy?: 'tags'|'mood'|'history'|'mixed';
+  maxLinks?: 3;
+}
+```
+
+**Selection algorithm** (typical “mixed”):
+
+1. same‑chapter, tag overlap ≥ 1;
+2. then mood match;
+3. then reader’s recent history affinity;
+4. fallback: top read pages. Weight scores to pick up to `maxLinks`.
+
+**Presentation**
+
+* Render pages as polaroid cards; red thread curves between the current page and each suggestion; hover reveals a tiny description.
+
+---
+
+## 5) Inline Editor Tools (Admin‑only)
+
+### 5.1 TipTap Extensions
+
+Create custom nodes/marks:
+
+* `redThread` (block): connects two anchors on the page.
+* `knotNote` (mark): inline heart knot with a tooltip note (private by default; can toggle public).
+* `instagramEmbed` (node): stores Reel URL + derived oEmbed HTML; responsive wrapper.
+* `spotifyEmbed` (node): stores Spotify URI/URL; renders iframe with iFrame API hooks.
+
+**Common behaviors**
+
+* Drag handles for `redThread` endpoints (snap to headings/blocks).
+* Paste detection: if an Instagram or Spotify URL is pasted, auto‑convert to corresponding node.
+* Slash menu: `/reel`, `/spotify`, `/thread`, `/knot`.
+
+### 5.2 Red Thread Block
+
+* **Model:** `{ fromAnchorId, toAnchorId, style?: 'straight'|'bezier', note?: string }`.
+* **Rendering:** SVG path layered beneath content; maintains layout on reflow; recompute path on resize.
+* **Editor UI:** draggable endcaps; delete/duplicate; color/tension controls.
+
+### 5.3 Knot Notes
+
+* **Model:** `{ anchorBlockId, offset, text, visibility: 'private'|'public' }`.
+* Inline heart icon; click → popover editor. Public notes render to readers as subtle tooltips.
+
+### 5.4 Edited Time Control
+
+* Toggle: `Use manual date` → date‑time picker. Stores `editedAtManual`; auto shows `editedAtAuto` otherwise.
+
+---
+
+## 6) Embeds
+
+### 6.1 Instagram Reels
+
+* Store the pasted Reel URL on the node; fetch oEmbed (server or SSR) to get embed HTML; render within a responsive container (maintain width 100%, height auto). Load Instagram `embed.js` once per page.
+* Fallback: show a preview card with a “Watch on Instagram” link if embedding is restricted.
+
+### 6.2 Spotify
+
+* Accept Spotify URL/URI for track/playlist/album/episode. Render iframe embed. Optionally initialize the **iFrame API** to receive play/pause events for analytics.
+
+---
+
+## 7) Reading Analytics (Precise Active Time + Re‑reads)
+
+### 7.1 Client tracking logic
+
+* **Start:** on page mount → POST `/api/analytics/pageview/start` → returns `pageViewId` & `heartbeatIntervalMs` (default 10s).
+* **Active time counter** runs only when all are true:
+
+  * `document.visibilityState === 'visible'`
+  * `document.hasFocus() === true`
+  * **not idle**: reset idle timer on `mousemove`, `keydown`, `scroll`, `touchstart`; if no activity ≥ 20s → pause.
+* **Heartbeat:** every 10s send `{ pageViewId, activeMsDelta, maxScrollPct, newlyHitMilestones[] }`.
+* **Milestones:** track 25/50/75/100 via `IntersectionObserver` on content markers (e.g., divs at 25% page height). Emit once per view.
+* **End:** on `pagehide`/route change/unload → POST `/api/analytics/pageview/end` with final `activeMs` and `maxScrollPct`.
+
+### 7.2 Server events & derivations
+
+* Create **Session** on first hit (read request headers → UA; resolve city/country via geo service). Set `HttpOnly` session cookie.
+* Each **PageView** aggregates active time, milestones, scroll max, and media events. If another PageView for the same session+page occurs later, set `rereadOfId` to the first occurrence for re‑read analytics.
+
+### 7.3 Media event capture
+
+* Wrap embeds with a transparent play overlay (fires `media_play`). For Spotify, also listen to iFrame API callbacks for `play/pause/ended/seek`.
+
+### 7.4 API Endpoints (sketch)
+
+```
+POST /api/analytics/session/start   -> { sessionId }
+POST /api/analytics/pageview/start  -> { pageViewId, heartbeatIntervalMs }
+POST /api/analytics/heartbeat       -> { pageViewId, activeMsDelta, maxScrollPct, milestones[] }
+POST /api/analytics/pageview/end    -> { pageViewId, activeMsFinal, maxScrollPct }
+POST /api/analytics/media           -> { pageViewId, mediaType, mediaId, action, positionSec? }
+```
+
+### 7.5 Admin Dashboard Views
+
+* **Timeline (per page):** list of PageViews with start/end times, **Active time**, **Max scroll**, **Completion**, and **Re‑read** badges; visualize as knots on a horizontal thread.
+* **Journey (per session):** circular chapter layout with a red thread tracing the reading path; hover shows timestamps.
+* **KPIs:** Visitors (today/7/30), Avg active time, Avg completion, Top pages/chapters, Top cities/devices.
+* **Export:** CSV for Sessions, PageViews, ReadProgress, MediaEvents.
+
+---
+
+## 8) Accessibility & Privacy
+
+* All motion respects `prefers-reduced-motion` (switch animations to fades/static).
+* Sufficient color contrast; keyboard focus indicators for knots and fate links.
+* Consent banner for analytics + embeds. IPs anonymized; only city/country stored.
+* Opt‑out toggle that disables client tracking.
+
+---
+
+## 9) File Layout (suggested)
+
+```
+app/
+  layout.tsx
+  page.tsx (home)
+  chapters/[slug]/page/[slug]/page.tsx    // reader view
+  admin/
+    pages/[id]/edit/page.tsx              // inline editor
+  api/analytics/
+    session/start/route.ts
+    pageview/start/route.ts
+    heartbeat/route.ts
+    pageview/end/route.ts
+    media/route.ts
+components/
+  ThreadBar.tsx
+  Knot.tsx
+  FateLinks.tsx
+  embeds/InstagramEmbed.tsx
+  embeds/SpotifyEmbed.tsx
+  editor/extensions/
+    redThread.ts
+    knotNote.ts
+    instagramEmbed.ts
+    spotifyEmbed.ts
+lib/
+  analytics.ts
+  auth.ts
+  geo.ts
+styles/
+  theme.css
+```
+
+---
+
+## 10) Acceptance Criteria
+
+1. **Roles**: Reader cannot edit; Admin sees inline editor with publish/draft and manual Edited‑on control.
+2. **Reels**: A pasted Instagram Reel URL renders a full, responsive embed (or a graceful fallback card).
+3. **Spotify**: A pasted Spotify URL renders a working player; play/pause tracked in analytics.
+4. **Active Time**: Switching tabs, blurring window, or idling ≥ 20s pauses the counter; resuming interaction continues it. Page unload finalizes time.
+5. **Progress & Knots**: ThreadBar shows knots at 25/50/75/100; completion is stored per PageView.
+6. **Re‑reads**: Returning to the same page creates a new PageView linked to the first; dashboard marks “Re‑read” with timestamps.
+7. **Journey**: Admin can view a session journey map with timestamps between pages.
+8. **Theme**: K‑drama palette, fonts, and red‑string visuals applied across sidebar, headers, embeds, and dividers.
+
+---
+
+## 11) Implementation Notes (hints for code‑gen)
+
+* Use TipTap JSON for content; render reader pages from JSON → React components.
+* Create a lightweight `useReadingTracker()` hook that exposes `{ progress, paused, activeMs }` and posts heartbeats.
+* Place invisible markers at 25/50/75/100% of the content height for IntersectionObserver.
+* Load Instagram `embed.js` once; re‑parse embeds on client navigation.
+* For Spotify, initialize the iFrame API once, passing the iframe element; attach `play/pause` listeners to emit MediaEvents.
+* Use SVG for thread/knots; keep them under 2KB; throttle resize/scroll handlers.
+* Edge middleware can set a session cookie early and attach basic geo (if on Cloudflare/Vercel with geo headers available).
+
+---
+
+## 12) Future Enhancements (optional)
+
+* Reader reactions (💖 🔥 😭 😮) per paragraph; export highlights.
+* Reading streaks and badges; “OST of this scene” tinting the page UI.
+* Passcode‑locked chapters; per‑page share links.
+
+---
+
+**End of Spec**
